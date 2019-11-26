@@ -10,7 +10,13 @@ import itertools
 SERVERDATA_AUTH = 3
 SERVERDATA_AUTH_RESPONSE = 2
 SERVERDATA_EXECCOMMAND = 2
+SQUAD_CHAT_STREAM = 1
 SERVERDATA_RESPONSE_VALUE = 0
+# NOTE(bsubei): I completely invented this type just to internally signal end of multipacket response.
+END_OF_MULTIPACKET = 77
+
+# Special response by the Squad server to indicate the end of a multipacket response.
+SPECIAL_MULTIPACKET_RESPONSE = b'\x00\x01\x00\x00\x00\x00\x00'
 
 
 class RconPacket(object):
@@ -82,7 +88,7 @@ class RconConnection(object):
         cmd_pkt = RconPacket(next(self.pkt_id), SERVERDATA_EXECCOMMAND,
                              command)
         self._send_pkt(cmd_pkt)
-        resp = self.read_response(cmd_pkt, True)
+        resp = self.read_response(cmd_pkt, multi=True)
         return resp.body
 
     def _send_pkt(self, pkt):
@@ -90,6 +96,7 @@ class RconConnection(object):
 
             Raises:
                 RconSizeError if the size of the specified packet is > 4096 bytes
+                RconError if the received packet header is malformed
         """
         if pkt.size() > 4096:
             raise RconSizeError('pkt_size > 4096 bytes')
@@ -102,6 +109,14 @@ class RconConnection(object):
             header = self._sock.recv(struct.calcsize('<3i'))
             if len(header) != 0:
                 break
+
+        # We got a weird packet here! If it's the special multipacket message, there is nothing left to read for this
+        # packet.
+        if len(header) != struct.calcsize('<3i'):
+            if header == SPECIAL_MULTIPACKET_RESPONSE:
+                return RconPacket(-1, END_OF_MULTIPACKET, '')
+            else:
+                raise RconError('Received malformed packet header!')
 
         (pkt_size, pkt_id, pkt_type) = struct.unpack('<3i', header)
         body = self._sock.recv(pkt_size - 8)
@@ -152,8 +167,18 @@ class RconConnection(object):
             elif response.pkt_id != req_pkt.pkt_id:
                 raise RconError('Response ID does not match request ID')
             body_parts.append(response.body)
-        # Read and ignore the extra empty body response
-        self._recv_pkt()
+        # NOTE(bsubei): for Squad servers, end of multipacket is signalled by an empty body response and a special
+        # 7-byte packet.
+        empty_response = self._recv_pkt()
+        if empty_response.pkt_type != SERVERDATA_RESPONSE_VALUE and empty_response.pkt_id != response.pkt_id:
+            raise RconError('Expected empty response after multipacket')
+        end_of_multipacket = self._recv_pkt()
+        if end_of_multipacket.pkt_type != END_OF_MULTIPACKET:
+            raise RconError('Expected end-of-multipacket response not received!')
+        else:
+            print('Found end of multipacket!')
+
+        # Return the packet.
         return RconPacket(req_pkt.pkt_id, SERVERDATA_RESPONSE_VALUE,
                           ''.join(str(body_parts)))
 
