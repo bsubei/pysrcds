@@ -1,9 +1,10 @@
 # Copyright (C) 2013 Peter Rowlands
 """Source server RCON communications module"""
 
+import itertools
+import re
 import struct
 import socket
-import itertools
 
 
 # Packet types
@@ -61,6 +62,7 @@ class RconConnection(object):
         self.single_packet_mode = single_packet_mode
         self._sock = socket.create_connection((server, port))
         self.pkt_id = itertools.count(1)
+        self.chat_messages = []
         self._authenticate(password)
 
     def _authenticate(self, password):
@@ -105,14 +107,17 @@ class RconConnection(object):
 
     def _recv_pkt(self):
         """Read one RCON packet"""
+        # The header is made of three little-endian integers (8 bytes each).
+        HEADER_SIZE = struct.calcsize('<3i')
         while True:
-            header = self._sock.recv(struct.calcsize('<3i'))
+            # Skip empty packets and try again.
+            header = self._sock.recv(HEADER_SIZE)
             if len(header) != 0:
                 break
 
         # We got a weird packet here! If it's the special multipacket message, there is nothing left to read for this
         # packet.
-        if len(header) != struct.calcsize('<3i'):
+        if len(header) != HEADER_SIZE:
             if header == SPECIAL_MULTIPACKET_RESPONSE:
                 return RconPacket(-1, END_OF_MULTIPACKET, '')
             else:
@@ -142,8 +147,15 @@ class RconConnection(object):
                                  ' read a multi-packet response')
             response = self._read_multi_response(request)
         else:
+            # TODO(bsubei): did not test chat packets for single packet responses.
             response = self._recv_pkt()
-        if not self.single_packet_mode and response.pkt_type not in (SERVERDATA_RESPONSE_VALUE, SERVERDATA_AUTH_RESPONSE):
+            # NOTE(bsubei): chat packets may come at any point. Just store them and continue with the normal response.
+            # In this case we recursively call read_response until we get a non-chat packet.
+            if response.pkt_type == SQUAD_CHAT_STREAM:
+                self.chat_messages.append(response.body.decode('utf-8'))
+                return self.read_response(request)
+        if (not self.single_packet_mode and
+                response.pkt_type not in (SERVERDATA_RESPONSE_VALUE, SERVERDATA_AUTH_RESPONSE)):
             raise RconError('Recieved unexpected RCON packet type')
         if request and response.pkt_id != request.pkt_id:
             raise RconError('Response ID does not match request ID')
@@ -158,8 +170,14 @@ class RconConnection(object):
         # packet with an empty body. So we should concatenate any packets until
         # we receive a response that matches the ID in chk_pkt
         body_parts = []
+        # TODO(bsubei): different messages may have different encodings (ascii vs utf-8) based on the kinds of player
+        # names for commands like 'ListPlayers'. Keep an eye out for that bug.
         while True:
             response = self._recv_pkt()
+            # NOTE(bsubei): chat packets may come at any point. Just store them and continue with the normal response.
+            if response.pkt_type == SQUAD_CHAT_STREAM:
+                self.chat_messages.append(response.body.decode('utf-8'))
+                continue
             if response.pkt_type != SERVERDATA_RESPONSE_VALUE:
                 raise RconError('Received unexpected RCON packet type')
             if response.pkt_id == chk_pkt.pkt_id:
@@ -175,12 +193,37 @@ class RconConnection(object):
         end_of_multipacket = self._recv_pkt()
         if end_of_multipacket.pkt_type != END_OF_MULTIPACKET:
             raise RconError('Expected end-of-multipacket response not received!')
-        else:
-            print('Found end of multipacket!')
 
         # Return the packet.
         return RconPacket(req_pkt.pkt_id, SERVERDATA_RESPONSE_VALUE,
                           ''.join(str(body_parts)))
+
+    def get_player_chat(self):
+        """ Returns the stored chat messages. """
+        return self.chat_messages
+
+    def get_parsed_player_chat(self):
+        """
+        Parses the stored player chat into a dict of steam IDs mapping to a list of their messages in chronological
+        order.
+
+        :return: dict(str->list(str)) The parsed mapping between player IDs and the list of player chat messages.
+        """
+        player_messages = dict()
+        STEAM_ID_PATTERN = r'\[SteamID:(\w*)\]'
+        for msg in self.get_player_chat():
+            # TODO catch any regex fails and continue
+            text = msg.strip('\x00')
+            player_id = re.search(STEAM_ID_PATTERN, text).group(1)
+            if player_id in player_messages:
+                player_messages[player_id].append(text)
+            else:
+                player_messages.update({player_id: [text]})
+        return player_messages
+
+    def clear_player_chat(self):
+        """ Clears the chat messages (becomes an empty list). """
+        self.chat_messages = []
 
 
 class RconError(Exception):
