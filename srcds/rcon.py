@@ -116,12 +116,11 @@ class RconConnection(object):
                 break
 
         # We got a weird packet here! If it's the special multipacket message, there is nothing left to read for this
-        # packet.
+        # packet. Otherwise, it's a malformed packet header.
+        if header == SPECIAL_MULTIPACKET_RESPONSE:
+            return RconPacket(-1, END_OF_MULTIPACKET, '')
         if len(header) != HEADER_SIZE:
-            if header == SPECIAL_MULTIPACKET_RESPONSE:
-                return RconPacket(-1, END_OF_MULTIPACKET, '')
-            else:
-                raise RconError('Received malformed packet header!')
+            raise RconError('Received malformed packet header!')
 
         (pkt_size, pkt_id, pkt_type) = struct.unpack('<3i', header)
         body = self._sock.recv(pkt_size - 8)
