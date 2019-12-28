@@ -1,6 +1,7 @@
 # Copyright (C) 2013 Peter Rowlands
 """Source server RCON communications module"""
 
+import contextlib
 import itertools
 import logging
 import re
@@ -23,8 +24,21 @@ END_OF_MULTIPACKET = 77
 SPECIAL_MULTIPACKET_HEADER = b'\x00\x01\x00\x00\x00\x00\x00'
 SPECIAL_MULTIPACKET_BYTES = b'\x00\x00\x00\x01\x00\x00\x00'
 
-# Use this string as the ID for when we're unable to parse the regex for the Steam ID in chat messages.
+# Use these strings for when we're unable to parse the regex for the Steam ID and player name in chat messages.
 UNKNOWN_PLAYER_ID = 'Unknown Player ID'
+UNKNOWN_PLAYER_NAME = 'Unknown Player Name'
+
+
+class PlayerChat(object):
+    """Represents chat messages from a player"""
+
+    def __init__(self, player_id, player_name, messages=[]):
+        self.player_id = player_id
+        self.player_name = player_name
+        self.messages = messages
+
+    def __str__(self):
+        return f'ID: {self.player_id}, name: {self.player_name}, messages: {self.messages}'
 
 
 class RconPacket(object):
@@ -50,6 +64,14 @@ class RconPacket(object):
                            bytearray(self.body, 'utf-8'))
 
 
+@contextlib.contextmanager
+def get_managed_rcon_connection(*args, **kwargs):
+    """ Yields a managed RconConnection (closes its socket when leaving context). """
+    conn = RconConnection(*args, **kwargs)
+    yield conn
+    conn._sock.close()
+
+
 class RconConnection(object):
     """RCON client to server connection"""
 
@@ -69,8 +91,15 @@ class RconConnection(object):
         self.single_packet_mode = single_packet_mode
         self._sock = socket.create_connection((server, port))
         self.pkt_id = itertools.count(1)
-        self.chat_messages = dict()
+        self.all_player_chat = dict()
         self._authenticate(password)
+
+    def __enter__(self):
+        print('enter method called')
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_traceback):
+        print('exit method called')
 
     def _authenticate(self, password):
         """Authenticate with the server using the given password."""
@@ -210,17 +239,20 @@ class RconConnection(object):
         return RconPacket(req_pkt.pkt_id, SERVERDATA_RESPONSE_VALUE,
                           ''.join(str(body_parts)))
 
-    def get_chat_messages(self):
-        """ Returns the stored chat messages. """
-        return self.chat_messages
+    def get_player_chat(self):
+        """ Returns the stored player chat objects. """
+        return self.all_player_chat
 
     def add_chat_message(self, chat_message):
         """
-        Parses the incoming chat message and adds it to the player messages dict (mapping Steam IDs to a list of their
-        messages) in chronological order.
+        Parses the incoming chat message and adds it to the player chat dict, mapping Steam IDs to a list of their
+        player chat objects. (The messages are added in chronological order).
 
-        :return: dict(str->list(str)) The parsed mapping between player IDs and the list of player chat messages.
+        :return: dict(str->PlayerChat) The parsed mapping between player IDs and the player chat objects.
         """
+        # An example chat message:
+        # '[ChatAll] [SteamID:12345678901234567] [FP] Clan Member 1 : Hello world! '
+
         # Use the SteamID regex as the player_id key. If regex fails, use an 'unknown' player id and move on.
         STEAM_ID_PATTERN = r'\[SteamID:(\w*)\]'
         try:
@@ -229,19 +261,62 @@ class RconConnection(object):
         except Exception:
             player_id = UNKNOWN_PLAYER_ID
 
+        # Use this regex to get the player_name. Use unknown name if failed.
+        PLAYER_NAME_PATTERN = r'\[SteamID:\w*\](.*):'
+        try:
+            text = chat_message.strip('\x00')
+            player_name = re.search(PLAYER_NAME_PATTERN, text).group(1)
+        except Exception:
+            player_name = UNKNOWN_PLAYER_NAME
+
         # If the dict has this key before, just append a new message to the list of messages belonging to that key.
-        if player_id in self.chat_messages:
-            self.chat_messages[player_id].append(text)
+        if player_id in self.all_player_chat:
+            self.all_player_chat[player_id].all_player_chat.append(text)
         else:
             # Add the player id and the message as a list if it's the first time we see it.
-            self.chat_messages.update({player_id: [text]})
+            self.all_player_chat.update({player_id: PlayerChat(player_id, player_name, [text])})
 
         # Return the chat messages.
-        return self.chat_messages
+        return self.all_player_chat
 
-    def clear_chat_messages(self):
-        """ Clears the chat messages (becomes an empty dict). """
-        self.chat_messages = dict()
+    def clear_player_chat(self):
+        """ Clears the player chat objects (becomes an empty dict). """
+        self.all_player_chat = dict()
+
+    def get_current_and_next_map(self):
+        """ Returns the current and next maps by querying the RCON server and parsing the response using regex. """
+        response = self.exec_command('ShowNextMap')
+        current_map, next_map = (None, None)
+        try:
+            current_map = re.search(r'Current map is (.+),', response).group(1)
+            next_map = re.search(r", Next map is (.+)\\x00\\x00']", response).group(1)
+        except AttributeError as e:
+            logger.error(f'Failed to parse ShowNextMap {current_map}, {next_map}: {e}')
+        finally:
+            return current_map, next_map
+
+    def get_all_player_ids(self):
+        """
+        Requests the list of players from the RCON server and returns the list of active player IDs as a list(str).
+        """
+        # An example response for ListPlayers (note the weird newline chars and the \\x00 bytes):
+        # "[b'----- Active Players -----\\n
+        # ID: 2 | SteamID: 01234567890123456 | Name: [FP] Clan Member 1 | Team ID: 2 | Squad ID: N/A\\n
+        # ID: 0 | SteamID: 01234567890123456 | Name: [FP] Clan Member 2 | Team ID: 1 | Squad ID: N/A\\n
+        # ID: 3 | SteamID: 01234567890123456 | Name: some lame rando | Team ID: 2 | Squad ID: N/A\\n
+        # ----- Recently Disconnected Players [Max of 15] -----\\n
+        # ID: 7 | SteamID: 01234567890123456 | Since Disconnect: 04m.11s | Name: Some Bored Dude\\x00\\x00']"
+        response = self.exec_command(f'ListPlayers')
+        # Removes the first part ('Active Players' header).
+        parsed_response = response.split('\\n')[1:]
+        # Removes the last part ('Recently Disconnected Players' section).
+        index = next(
+            (i for (i, x) in enumerate(parsed_response) if 'Recently Disconnected Players' in x),
+            len(parsed_response)
+            )
+        parsed_response = parsed_response[:index]
+        # Now split the response into just the player ids.
+        return [r.split('|')[1].split('SteamID:')[-1].strip() for r in parsed_response]
 
 
 class RconError(Exception):
