@@ -271,7 +271,7 @@ class RconConnection(object):
 
         # If the dict has this key before, just append a new message to the list of messages belonging to that key.
         if player_id in self.all_player_chat:
-            self.all_player_chat[player_id].all_player_chat.append(text)
+            self.all_player_chat[player_id].messages.append(text)
         else:
             # Add the player id and the message as a list if it's the first time we see it.
             self.all_player_chat.update({player_id: PlayerChat(player_id, player_name, [text])})
