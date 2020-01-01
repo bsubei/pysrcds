@@ -289,7 +289,7 @@ class RconConnection(object):
         current_map, next_map = (None, None)
         try:
             current_map = re.search(r'Current map is (.+),', response).group(1)
-            next_map = re.search(r", Next map is (.+)\\x00\\x00']", response).group(1)
+            next_map = re.search(r", Next map is (.+)\\x00\\x00'*\"*]", response).group(1)
         except AttributeError as e:
             logger.error(f'Failed to parse ShowNextMap {current_map}, {next_map}: {e}')
         finally:
