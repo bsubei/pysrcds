@@ -37,7 +37,7 @@ class PlayerChat(object):
         self.player_name = player_name
         self.messages = messages
 
-    def __str__(self):
+    def __repr__(self):
         return f'ID: {self.player_id}, name: {self.player_name}, messages: {self.messages}'
 
 
